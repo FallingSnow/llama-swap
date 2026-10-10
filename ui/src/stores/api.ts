@@ -400,9 +400,10 @@ export async function unloadAllModels(): Promise<void> {
   }
 }
 
-export async function unloadSingleModel(model: string): Promise<void> {
+export async function unloadSingleModel(model: string, force = false): Promise<void> {
   try {
-    const response = await fetch(`/api/models/unload/${model}`, {
+    const qs = force ? "?force=true" : "";
+    const response = await fetch(`/api/models/unload/${model}${qs}`, {
       method: "POST",
     });
     if (!response.ok) {

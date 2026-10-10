@@ -2,6 +2,7 @@ package process
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -16,9 +17,20 @@ const (
 	StateReady    ProcessState = ProcessState("ready")
 	StateStopping ProcessState = ProcessState("stopping")
 
-	// process is shutdown and will not be restarted
+	// StateSuspended means the process is still alive, but its accelerator
+	// (GPU) state has been offloaded via a Sleeper (e.g. cuda-checkpoint), so
+	// it no longer holds a GPU and is not serving requests. It is brought
+	// back to StateReady by restoring the state (EnsureReady) rather than by
+	// starting a fresh process.
+	StateSuspended ProcessState = ProcessState("suspended")
+
+	// StateShutdown means the process is shut down and will not be restarted.
 	StateShutdown ProcessState = ProcessState("shutdown")
 )
+
+// ErrShutdown is returned by Process methods when the parent context has been
+// cancelled, indicating the process is being shut down.
+var ErrShutdown = fmt.Errorf("shutdown")
 
 // Status is a snapshot of a process's state together with when it became
 // ready. All fields are read at once, so they never disagree.
@@ -63,9 +75,17 @@ type Process interface {
 	//	shutdown -> returns an error
 	EnsureReady(ctx context.Context, timeout time.Duration) error
 
-	// Stop blocks until the process has terminated. It returns nil when
-	// the process terminated as expected (exit 0)
+	// Stop blocks until the process has terminated. If a sleeper is configured
+	// and the process is ready, it suspends (offloads the accelerator state)
+	// rather than killing. It returns nil when the process terminated as
+	// expected (exit 0).
 	Stop(timeout time.Duration) error
+
+	// StopForce blocks until the process has terminated, skipping any
+	// configured sleeper so the process is always killed. A StopForce on an
+	// already-suspended process kills it (unlike Stop, which is a no-op in
+	// that case). It returns nil when the process terminated as expected.
+	StopForce(timeout time.Duration) error
 
 	// State returns the current state of the process
 	// Note: this is a snapshot of the state at the time of the call

@@ -172,6 +172,10 @@ func (f *fakeProcess) Run(_ time.Duration) error {
 	return nil
 }
 
+func (f *fakeProcess) StopForce(timeout time.Duration) error {
+	return f.Stop(timeout)
+}
+
 func (f *fakeProcess) Stop(timeout time.Duration) error {
 	f.opMu.Lock()
 	defer f.opMu.Unlock()

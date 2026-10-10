@@ -67,7 +67,7 @@ func (s *stubRouter) RunningStatus() map[string]process.Status {
 	}
 	return out
 }
-func (s *stubRouter) Unload(timeout time.Duration, models ...string) {
+func (s *stubRouter) Unload(timeout time.Duration, force bool, models ...string) {
 	s.unloadCalls.Add(1)
 	s.unloadTimeout = timeout
 	s.unloadModels = append([]string(nil), models...)

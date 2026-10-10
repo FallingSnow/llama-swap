@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConfig_ModelConfigSanitizedCommand(t *testing.T) {
@@ -435,6 +436,47 @@ models:
 		mc := config.Models["model1"]
 		assert.Equal(t, []string{"text", "image", "video"}, mc.Capabilities.In)
 		assert.Equal(t, []string{"text"}, mc.Capabilities.Out)
+	})
+}
+
+func TestConfig_ModelSwapOutStrategy_Validate(t *testing.T) {
+	t.Run("empty_is_valid", func(t *testing.T) {
+		assert.NoError(t, ModelConfig{}.Validate())
+	})
+
+	t.Run("cuda_checkpoint_is_valid", func(t *testing.T) {
+		assert.NoError(t, ModelConfig{SwapOutStrategy: "cuda-checkpoint"}.Validate())
+	})
+
+	t.Run("typo_is_rejected", func(t *testing.T) {
+		err := ModelConfig{SwapOutStrategy: "cuda-checkpount"}.Validate()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "swapOutStrategy")
+		assert.Contains(t, err.Error(), "cuda-checkpount")
+	})
+
+	t.Run("rejects_invalid_at_load", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    swapOutStrategy: cuda-checkpount
+`
+		_, err := LoadConfigFromReader(strings.NewReader(content))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cuda-checkpount")
+	})
+
+	t.Run("valid_at_load", func(t *testing.T) {
+		content := `
+models:
+  model1:
+    cmd: path/to/cmd --port ${PORT}
+    swapOutStrategy: cuda-checkpoint
+`
+		config, err := LoadConfigFromReader(strings.NewReader(content))
+		assert.NoError(t, err)
+		assert.Equal(t, "cuda-checkpoint", config.Models["model1"].SwapOutStrategy)
 	})
 }
 

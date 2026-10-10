@@ -3,6 +3,8 @@
 package process
 
 import (
+	"errors"
+	"os"
 	"os/exec"
 	"syscall"
 )
@@ -32,13 +34,25 @@ func killProcessTree(cmd *exec.Cmd) error {
 // child was started with Setpgid it is its own group leader (pgid == pid), so
 // targeting -pid reaches the child and every descendant still in the group.
 // Falls back to signalling just the child if the group send fails (e.g. the
-// group has already drained), so we never silently skip the signal.
+// group has already drained).
+//
+// Returns nil if the process (or group) is already gone, since the goal — the
+// process no longer running — is already achieved.
 func signalProcessTree(cmd *exec.Cmd, sig syscall.Signal) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	if err := syscall.Kill(-cmd.Process.Pid, sig); err != nil {
-		return cmd.Process.Signal(sig)
+	err := syscall.Kill(-cmd.Process.Pid, sig)
+	if err == nil {
+		return nil
+	}
+	// Group signal failed: try the process directly. If that also fails
+	// because the process is already dead, treat it as success.
+	if perr := cmd.Process.Signal(sig); perr != nil {
+		if errors.Is(perr, os.ErrProcessDone) {
+			return nil
+		}
+		return perr
 	}
 	return nil
 }

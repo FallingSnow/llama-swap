@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sort"
@@ -24,6 +25,7 @@ type shutdownReq struct {
 type unloadReq struct {
 	targets []string
 	timeout time.Duration
+	force   bool
 	respond chan struct{}
 }
 
@@ -128,7 +130,7 @@ func (b *baseRouter) run() {
 			b.notifyProcessed()
 
 		case req := <-b.unloadCh:
-			b.schedule.OnUnload(req.targets, req.timeout)
+			b.schedule.OnUnload(req.targets, req.timeout, req.force)
 			close(req.respond)
 			b.notifyProcessed()
 
@@ -199,8 +201,9 @@ func (b *baseRouter) GrantServe(req scheduler.HandlerReq, modelID string) bool {
 }
 
 // StopProcesses implements scheduler.Effects, stopping the named processes in
-// parallel and blocking until all have stopped.
-func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
+// parallel and blocking until all have stopped. When force is true the
+// processes are killed directly, skipping any configured sleeper.
+func (b *baseRouter) StopProcesses(timeout time.Duration, force bool, ids []string) {
 	var wg sync.WaitGroup
 	for _, id := range ids {
 		p, ok := b.processes[id]
@@ -210,7 +213,13 @@ func (b *baseRouter) StopProcesses(timeout time.Duration, ids []string) {
 		wg.Add(1)
 		go func(id string, p process.Process) {
 			defer wg.Done()
-			if err := p.Stop(timeout); err != nil {
+			var err error
+			if force {
+				err = p.StopForce(timeout)
+			} else {
+				err = p.Stop(timeout)
+			}
+			if err != nil {
 				b.logger.Warnf("%s: stopping %s failed: %v", b.name, id, err)
 			}
 		}(id, p)
@@ -283,24 +292,25 @@ func (b *baseRouter) handleShutdown(req shutdownReq) {
 	// The OnShutdown grants below then either land (waiter happened to receive
 	// before noticing shutdown) or fall through immediately via grant's
 	// shutdownCtx case — either way the waiter sees a non-OK response.
-	// This does NOT touch processes: their lifetime is procCtx, cancelled
-	// only after the graceful Stop() calls below have reaped them.
 	b.shutdownFn()
 
 	b.schedule.OnShutdown(shutdownErr)
 
-	stopTimeout := req.timeout
-	if stopTimeout <= 0 {
-		stopTimeout = b.healthCheckTimeout()
-	}
+	// Cancel procCtx before the Stop() calls. Each process's run loop sees
+	// parentCtx.Done() and kills its process directly (no suspend). The Stop()
+	// calls below then return immediately via their own parentCtx.Done()
+	// select branch, making them fast no-ops. This ordering ensures a sleeper
+	// is never invoked during shutdown — the GPU is freed by the kill, not by
+	// a slow checkpoint.
+	b.procCancel()
 
 	var wg sync.WaitGroup
 	for i, p := range b.processes {
 		wg.Add(1)
 		go func(id string, p process.Process) {
 			defer wg.Done()
-			if err := p.Stop(stopTimeout); err != nil {
-				b.logger.Warnf("%s failed to stop process %s: %v", b.name, id, err)
+			if err := p.Stop(0); err != nil && !errors.Is(err, process.ErrShutdown) {
+				b.logger.Warnf("%s: stop during shutdown: %v", b.name, err)
 			}
 		}(i, p)
 	}
@@ -320,11 +330,6 @@ func (b *baseRouter) handleShutdown(req shutdownReq) {
 	} else {
 		<-done
 	}
-
-	// Every process is stopped (children reaped via Stop()). Cancel procCtx so
-	// the process run-loop goroutines exit; they are already StateStopped, so
-	// this is a clean no-op kill rather than a forced teardown.
-	b.procCancel()
 
 	req.respond <- nil
 }
@@ -406,7 +411,7 @@ func (b *baseRouter) RunningStatus() map[string]process.Status {
 // usually mean multi-node unloads) cannot delay reclaiming the quick ones
 // queued behind it. A positive timeout overrides the configured values and
 // stops every target with that timeout.
-func (b *baseRouter) Unload(timeout time.Duration, models ...string) {
+func (b *baseRouter) Unload(timeout time.Duration, force bool, models ...string) {
 	targets := models
 	if len(targets) == 0 {
 		targets = make([]string, 0, len(b.processes))
@@ -419,7 +424,7 @@ func (b *baseRouter) Unload(timeout time.Duration, models ...string) {
 	}
 
 	if timeout > 0 {
-		b.sendUnload(targets, timeout)
+		b.sendUnload(targets, timeout, force)
 		return
 	}
 	buckets := make(map[time.Duration][]string)
@@ -433,14 +438,14 @@ func (b *baseRouter) Unload(timeout time.Duration, models ...string) {
 	}
 	sort.Slice(timeouts, func(i, j int) bool { return timeouts[i] < timeouts[j] })
 	for _, t := range timeouts {
-		b.sendUnload(buckets[t], t)
+		b.sendUnload(buckets[t], t, force)
 	}
 }
 
 // sendUnload funnels one unload request through the run loop and blocks until
 // the scheduler has stopped the targeted processes.
-func (b *baseRouter) sendUnload(targets []string, timeout time.Duration) {
-	req := unloadReq{targets: targets, timeout: timeout, respond: make(chan struct{})}
+func (b *baseRouter) sendUnload(targets []string, timeout time.Duration, force bool) {
+	req := unloadReq{targets: targets, timeout: timeout, force: force, respond: make(chan struct{})}
 	select {
 	case b.unloadCh <- req:
 	case <-b.runDone:

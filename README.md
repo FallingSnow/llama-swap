@@ -65,6 +65,7 @@ Built in Go for performance and simplicity, llama-swap has zero dependencies and
   - Switch model ID routing at runtime with profiles
   - Run concurrent models with a custom DSL swap matrix ([#643](https://github.com/mostlygeek/llama-swap/issues/643))
   - Automatic unloading of models after timeout by setting a `ttl`
+  - Fast swap-back by setting `swapOutStrategy` to `cuda-checkpoint` to offload GPU state instead of a cold restart
   - Docker and Podman support using `cmd` and `cmdStop` together
   - Preload models on startup with `hooks` ([#235](https://github.com/mostlygeek/llama-swap/pull/235))
   - Apply filters to requests to control inference with `stripParams`, `setParams` and `setParamsByID`
@@ -316,6 +317,7 @@ Almost all configuration settings are optional and can be added one step at a ti
 - Model customization
   - `ttl` to automatically unload models
   - `unloadTimeout` to tune graceful unloads (manual, API and `ttl` expiry)
+  - `swapOutStrategy` to offload GPU state via `cuda-checkpoint` instead of a cold restart
   - `aliases` to use familiar model names (e.g., "gpt-4o-mini")
   - `env` to pass custom environment variables to inference servers
   - `cmdStop` gracefully stop Docker/Podman containers

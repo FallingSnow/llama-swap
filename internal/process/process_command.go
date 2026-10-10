@@ -22,6 +22,12 @@ import (
 
 var ErrStartAborted = fmt.Errorf("aborted")
 
+// errPrematureExit signals that the upstream process exited before becoming
+// ready. pollHealth returns it so a caller can distinguish a premature exit
+// (just cancel the ctx, report "exited prematurely") from an abort (kill the
+// process, report the original error).
+var errPrematureExit = fmt.Errorf("upstream command exited prematurely")
+
 // healthCheckKey marks requests issued by the health check loop, which polls
 // the upstream through the same reverse proxy. Their failures are the expected
 // shape of a model still booting, so they must not be logged as proxy errors.
@@ -90,6 +96,7 @@ type startReq struct {
 
 type stopReq struct {
 	timeout time.Duration
+	force   bool
 	respond chan error
 }
 
@@ -99,7 +106,7 @@ type waitReadyReq struct {
 
 type startResult struct {
 	cmd       *exec.Cmd
-	cmdDone   chan struct{}
+	cmdDone   <-chan struct{}
 	cancel    context.CancelFunc
 	handlerFn http.HandlerFunc
 	err       error
@@ -112,6 +119,12 @@ type ProcessCommand struct {
 
 	processLogger *logmon.Monitor
 	proxyLogger   *logmon.Monitor
+
+	// sleeper, when non-nil, offloads the model's accelerator state on
+	// unload (freeing the GPU while the process stays alive) and restores it
+	// on swap-in, instead of killing and restarting the process. nil means
+	// the default kill/restart behavior.
+	sleeper Sleeper
 
 	// waitDelay is assigned to cmd.WaitDelay when starting the upstream
 	// process. Defaults to cmdWaitDelay; tests override it to keep the
@@ -150,8 +163,7 @@ func New(
 		config:        conf,
 		parentCtx:     parentCtx,
 		processLogger: processLogger,
-		proxyLogger:   proxyLogger,
-
+		proxyLogger:   proxyLogger, sleeper: newSleeper(conf, processLogger),
 		startCh:     make(chan startReq),
 		stopCh:      make(chan stopReq),
 		waitReadyCh: make(chan waitReadyReq),
@@ -256,8 +268,11 @@ func (p *ProcessCommand) run() {
 
 		// Upstream exited on its own (not via Stop). Drop handler state,
 		// transition to Stopped, and unblock the parked Run caller.
-		// cmdDone is nil while no process is running, so this case is
-		// dormant outside of StateReady.
+		// cmdDone is nil while no process is running, so this case is dormant
+		// in StateStopped. It also fires while StateSuspended: the process
+		// stays alive (and cmdDone latched) after a suspend, so a process that
+		// dies while offloaded reaches StateStopped here rather than being
+		// left stuck in StateSuspended for a later Run to try to restore.
 		case <-cmdDone:
 			if cmdCancel != nil {
 				cmdCancel()
@@ -311,17 +326,35 @@ func (p *ProcessCommand) run() {
 					continue
 				}
 			}
-			// Only valid from StateStopped. For Run this is also the "second
-			// Run while already running" rejection.
-			if state != StateStopped {
+			// Only valid from StateStopped or StateSuspended. For Run this is
+			// also the "second Run while already running" rejection.
+			if state != StateStopped && state != StateSuspended {
 				req.respond <- fmt.Errorf("[%s] could not be started in %s state", p.id, state)
 				continue
 			}
+			// wasSuspended captures whether we are restoring an offloaded
+			// process (StateSuspended) versus starting a fresh one (Stopped).
+			// It is read inside the start goroutine below, so capture it now
+			// before setState mutates the shared state variable.
+			wasSuspended := state == StateSuspended
 			setState(StateStarting)
 
 			startCtx, cancelStart := context.WithCancel(context.Background())
 			resultCh := make(chan startResult, 1)
 			go func() {
+				if wasSuspended {
+					// Restore the offloaded process in place. If the restore
+					// fails (sleeper error, health-check timeout, or the
+					// process died while suspended) the process is no longer
+					// usable, so tear it down and fall back to a fresh start.
+					res := p.doRestore(startCtx, req.timeout, cmd, cmdDone, cmdCancel)
+					if res.err != nil {
+						p.killProcess(cmd, cmdCancel, cmdDone, 5*time.Second)
+						res = p.doStart(startCtx, req.timeout)
+					}
+					resultCh <- res
+					return
+				}
 				resultCh <- p.doStart(startCtx, req.timeout)
 			}()
 
@@ -427,8 +460,48 @@ func (p *ProcessCommand) run() {
 				pendingStop.respond <- nil
 			}
 
-		// Stop: tear down a running process.
+		// Stop: tear down a running process. When a sleeper is configured and
+		// the process is ready, we suspend it (offloading the accelerator state
+		// and freeing the GPU while the process stays alive) instead of
+		// killing it. A Stop that arrives while a process is already suspended
+		// is a no-op.
 		case stop := <-p.stopCh:
+			// Already suspended: the GPU is free and the process is alive.
+			// A second Stop is a no-op — killing here would destroy the
+			// offloaded state and force a full reload on next use. A forced
+			// Stop skips this guard and kills the suspended process.
+			if state == StateSuspended && !stop.force {
+				stop.respond <- nil
+				continue
+			}
+			// A sleeper can only suspend a process that is ready to serve.
+			// Suspending from Starting/Stopped/Shutdown is meaningless, so it
+			// falls through to a normal kill. During parent shutdown the
+			// process will be killed shortly anyway, so skip the (slow)
+			// suspend and go straight to kill. A forced Stop skips the
+			// sleeper entirely.
+			if !stop.force && p.sleeper != nil && cmd != nil && state == StateReady && p.parentCtx.Err() == nil {
+				setState(StateStopping)
+				// Bound the suspend to parentCtx so a shutdown that starts while
+				// the checkpoint is in flight can escape it rather than waiting
+				// out the full sleepTimeout.
+				if err := p.suspendProcess(p.parentCtx, cmd); err == nil {
+					// Suspended: the process stays alive (cmd stays latched) but
+					// no longer holds a GPU and is not serving, so drop the
+					// handler and move to the suspended state. cmdCancel is left
+					// set — it is the safety net for this live process and is
+					// released when the process is later killed or restored.
+					p.handler.Store(nil)
+					setState(StateSuspended)
+					notifyWaiters(fmt.Errorf("[%s] suspended", p.id))
+					respondRun(fmt.Errorf("[%s] suspended", p.id))
+					stop.respond <- nil
+					continue
+				}
+				// Suspend failed: fall through to a normal kill below.
+			}
+			// Falling through to a kill covers: no sleeper, suspend just
+			// failed, or a Stop from Starting/Stopped states.
 			toreDown := cmd != nil
 			if cmd != nil {
 				setState(StateStopping)
@@ -466,55 +539,11 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		return startResult{err: fmt.Errorf("unable to get sanitized command: %w", err)}
 	}
 
-	proxyURL, err := url.Parse(p.config.Proxy)
-	if err != nil {
+	if _, err := url.Parse(p.config.Proxy); err != nil {
 		return startResult{err: fmt.Errorf("invalid proxy URL %q: %w", p.config.Proxy, err)}
 	}
 
-	reverseProxy := httputil.NewSingleHostReverseProxy(proxyURL)
-	reverseProxy.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   time.Duration(p.config.Timeouts.Connect) * time.Second,
-			KeepAlive: time.Duration(p.config.Timeouts.KeepAlive) * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout:   time.Duration(p.config.Timeouts.TLSHandshake) * time.Second,
-		ResponseHeaderTimeout: time.Duration(p.config.Timeouts.ResponseHeader) * time.Second,
-		ExpectContinueTimeout: time.Duration(p.config.Timeouts.ExpectContinue) * time.Second,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   10,
-		IdleConnTimeout:       time.Duration(p.config.Timeouts.IdleConn) * time.Second,
-		DisableKeepAlives:     p.config.DisableKeepAlives,
-	}
-	reverseProxy.ErrorHandler = newProxyErrorHandler(p.id, p.proxyLogger)
-	reverseProxy.ModifyResponse = func(resp *http.Response) error {
-		// Upstreams such as llama-server set their own CORS headers, and
-		// ReverseProxy adds rather than replaces them, so both llama-swap's
-		// and the upstream's would be sent. Keep only ours; see issue #85.
-		swaputil.StripUpstreamCORSHeaders(resp.Header)
-
-		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
-			resp.Header.Set("X-Accel-Buffering", "no")
-		}
-		return nil
-	}
-	// httputil.ReverseProxy panics with http.ErrAbortHandler when the upstream
-	// disconnects after response headers have been sent. Recover here so the
-	// streaming termination is treated as a normal client/upstream disconnect.
-	// see: https://github.com/golang/go/issues/23643
-	handlerFn := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() {
-			if rec := recover(); rec != nil {
-				if rec == http.ErrAbortHandler {
-					p.proxyLogger.Infof("<%s> recovered from upstream disconnection during streaming", p.id)
-				} else {
-					p.proxyLogger.Warnf("<%s> recovered from panic: %v", p.id, rec)
-				}
-			}
-		}()
-		reverseProxy.ServeHTTP(w, r)
-	})
+	handlerFn, reverseProxy := p.buildHandler()
 
 	// cmdCtx + cmd.Cancel are wired as a safety net: if the context is ever
 	// cancelled while the process is alive, cmd.Cancel sends SIGTERM / CmdStop
@@ -572,8 +601,9 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		return abort(ErrStartAborted)
 	}
 
-	checkEndpoint := strings.TrimSpace(p.config.CheckEndpoint)
-	if checkEndpoint == "none" {
+	// A "none" checkEndpoint means the process is ready the moment it starts,
+	// so skip the health-check polling entirely.
+	if strings.TrimSpace(p.config.CheckEndpoint) == "none" {
 		return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
 	}
 
@@ -584,33 +614,107 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	case <-time.After(250 * time.Millisecond):
 	}
 
-	// The deadline is pushed back each time the reported progress value
-	// changes, so healthCheckTimeout bounds how long a load may go without
-	// progress rather than how long it may take in total. A message alone does
-	// not count: it can change while the load is stuck, e.g. a growing ETA.
-	// Without a progress value, the deadline is fixed as before.
+	if err := p.pollHealth(startCtx, reverseProxy, healthCheckTimeout, cmdDone); err != nil {
+		if errors.Is(err, errPrematureExit) {
+			return prematureExit()
+		}
+		return abort(err)
+	}
+
+	return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
+}
+
+// buildHandler constructs the reverse proxy and its wrapping handler for the
+// model's upstream. It is shared by doStart and doRestore so a restored process
+// serves through the exact same proxy configuration as a fresh start. The
+// returned handlerFn is ready to store on p.handler; reverseProxy is returned so
+// callers that health-check through the proxy (pollHealth) can reuse it.
+func (p *ProcessCommand) buildHandler() (http.HandlerFunc, *httputil.ReverseProxy) {
+	proxyURL, err := url.Parse(p.config.Proxy)
+	if err != nil {
+		p.proxyLogger.Warnf("<%s> invalid proxy URL %q: %v", p.id, p.config.Proxy, err)
+	}
+
+	reverseProxy := httputil.NewSingleHostReverseProxy(proxyURL)
+	reverseProxy.Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   time.Duration(p.config.Timeouts.Connect) * time.Second,
+			KeepAlive: time.Duration(p.config.Timeouts.KeepAlive) * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout:   time.Duration(p.config.Timeouts.TLSHandshake) * time.Second,
+		ResponseHeaderTimeout: time.Duration(p.config.Timeouts.ResponseHeader) * time.Second,
+		ExpectContinueTimeout: time.Duration(p.config.Timeouts.ExpectContinue) * time.Second,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   10,
+		IdleConnTimeout:       time.Duration(p.config.Timeouts.IdleConn) * time.Second,
+		DisableKeepAlives:     p.config.DisableKeepAlives,
+	}
+	reverseProxy.ErrorHandler = newProxyErrorHandler(p.id, p.proxyLogger)
+	reverseProxy.ModifyResponse = func(resp *http.Response) error {
+		// Upstreams such as llama-server set their own CORS headers, and
+		// ReverseProxy adds rather than replaces them, so both llama-swap's
+		// and the upstream's would be sent. Keep only ours; see issue #85.
+		swaputil.StripUpstreamCORSHeaders(resp.Header)
+
+		if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+			resp.Header.Set("X-Accel-Buffering", "no")
+		}
+		return nil
+	}
+	// httputil.ReverseProxy panics with http.ErrAbortHandler when the upstream
+	// disconnects after response headers have been sent. Recover here so the
+	// streaming termination is treated as a normal client/upstream disconnect.
+	// see: https://github.com/golang/go/issues/23643
+	handlerFn := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				if rec == http.ErrAbortHandler {
+					p.proxyLogger.Infof("<%s> recovered from upstream disconnection during streaming", p.id)
+				} else {
+					p.proxyLogger.Warnf("<%s> recovered from panic: %v", p.id, rec)
+				}
+			}
+		}()
+		reverseProxy.ServeHTTP(w, r)
+	})
+	return handlerFn, reverseProxy
+}
+
+// pollHealth polls the upstream's check endpoint through reverseProxy until it
+// returns 200, the context is cancelled, or the process exits. It shares the
+// exact deadline + loading-progress semantics of a fresh start: the deadline is
+// pushed back each time the reported progress value changes, so
+// healthCheckTimeout bounds how long a load may go without progress rather than
+// how long it may take in total. A message alone does not count: it can change
+// while the load is stuck, e.g. a growing ETA.
+//
+// It returns nil when the upstream is ready; errPrematureExit when the process
+// exits first; or an error (timeout / context cancel) otherwise.
+func (p *ProcessCommand) pollHealth(ctx context.Context, reverseProxy *httputil.ReverseProxy, healthCheckTimeout time.Duration, cmdDone <-chan struct{}) error {
 	deadline := time.Now().Add(healthCheckTimeout)
 	var lastReport *LoadingProgress
 	var lastProgress *float64
 	for {
 		select {
-		case <-startCtx.Done():
-			return abort(ErrStartAborted)
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-cmdDone:
-			return prematureExit()
+			return errPrematureExit
 		default:
 		}
 
 		if time.Now().After(deadline) {
 			if lastProgress != nil {
-				return abort(fmt.Errorf("health check timed out after %v without loading progress", healthCheckTimeout))
+				return fmt.Errorf("health check timed out after %v without loading progress", healthCheckTimeout)
 			}
-			return abort(fmt.Errorf("health check timed out after %v", healthCheckTimeout))
+			return fmt.Errorf("health check timed out after %v", healthCheckTimeout)
 		}
 
 		// Tagged so the proxy ErrorHandler logs a not-yet-listening upstream
 		// at debug rather than as a proxy error once per poll.
-		checkCtx := context.WithValue(startCtx, healthCheckKey{}, true)
+		checkCtx := context.WithValue(ctx, healthCheckKey{}, true)
 		req, _ := http.NewRequestWithContext(checkCtx, "GET", p.config.CheckEndpoint, nil)
 		rr := httptest.NewRecorder()
 		reverseProxy.ServeHTTP(rr, req)
@@ -618,9 +722,9 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusOK {
 			p.proxyLogger.Infof("<%s> Health check passed on %s%s", p.id, p.config.Proxy, p.config.CheckEndpoint)
-			break
-		} else if startCtx.Err() != nil {
-			return abort(ErrStartAborted)
+			return nil
+		} else if ctx.Err() != nil {
+			return ctx.Err()
 		}
 
 		if lp, ok := parseLoadingProgress(rr.Body.Bytes()); ok {
@@ -635,15 +739,70 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 		}
 
 		select {
-		case <-startCtx.Done():
-			return abort(ErrStartAborted)
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-cmdDone:
-			return prematureExit()
+			return errPrematureExit
 		case <-time.After(time.Second):
 		}
 	}
+}
 
-	return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cmdCancel, handlerFn: handlerFn}
+// doRestore brings a suspended process back to a ready state. Unlike doStart it
+// does not spawn a new process: it re-acquires the accelerator state the sleeper
+// offloaded, rebuilds the reverse-proxy handler, and health-checks through it.
+// The existing cmd/cmdDone/cancel are echoed in the returned startResult so the
+// run() loop latches them exactly as it does after a fresh start.
+//
+// On any failure (a sleeper error, a health-check timeout, or a premature exit)
+// it returns a startResult with an err set and no cmd; the run() loop then falls
+// back to starting a fresh process via doStart.
+func (p *ProcessCommand) doRestore(startCtx context.Context, healthCheckTimeout time.Duration, cmd *exec.Cmd, cmdDone <-chan struct{}, cancel context.CancelFunc) startResult {
+	if p.sleeper == nil {
+		return startResult{err: fmt.Errorf("no sleeper configured for %s", p.id)}
+	}
+
+	p.proxyLogger.Infof("<%s> restoring suspended model", p.id)
+	// Bound the resume to startCtx so a concurrent Stop (which cancels it) can
+	// escape a stuck driver call instead of waiting out the full sleepTimeout.
+	if err := p.sleeper.Resume(startCtx, cmd); err != nil {
+		p.proxyLogger.Warnf("<%s> restore failed: %v; falling back to a fresh start", p.id, err)
+		return startResult{err: fmt.Errorf("restore: %w", err)}
+	}
+
+	handlerFn, reverseProxy := p.buildHandler()
+	if strings.TrimSpace(p.config.CheckEndpoint) == "none" {
+		return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cancel, handlerFn: handlerFn}
+	}
+
+	if err := p.pollHealth(startCtx, reverseProxy, healthCheckTimeout, cmdDone); err != nil {
+		if errors.Is(err, errPrematureExit) {
+			p.proxyLogger.Warnf("<%s> process exited during restore; falling back to a fresh start", p.id)
+			return startResult{err: fmt.Errorf("upstream command exited prematurely")}
+		}
+		p.proxyLogger.Warnf("<%s> health check failed after restore: %v; falling back to a fresh start", p.id, err)
+		return startResult{err: err}
+	}
+
+	p.proxyLogger.Infof("<%s> restored model is ready", p.id)
+	return startResult{cmd: cmd, cmdDone: cmdDone, cancel: cancel, handlerFn: handlerFn}
+}
+
+// suspendProcess offloads the accelerator state of a running process via the
+// configured sleeper. It returns nil on success, an error if the sleeper is
+// unavailable or fails — in which case the caller should fall back to a normal
+// kill.
+func (p *ProcessCommand) suspendProcess(ctx context.Context, cmd *exec.Cmd) error {
+	if p.sleeper == nil {
+		return fmt.Errorf("no sleeper configured for %s", p.id)
+	}
+	p.proxyLogger.Infof("<%s> suspending model to offload accelerator state", p.id)
+	if err := p.sleeper.Suspend(ctx, cmd); err != nil {
+		p.proxyLogger.Warnf("<%s> suspend failed: %v; falling back to a kill", p.id, err)
+		return err
+	}
+	p.proxyLogger.Infof("<%s> model suspended; accelerator state offloaded", p.id)
+	return nil
 }
 
 // sendStopSignal runs the configured CmdStop (if any) or sends SIGTERM to
@@ -825,14 +984,23 @@ func (p *ProcessCommand) WaitReady(ctx context.Context) error {
 }
 
 func (p *ProcessCommand) Stop(timeout time.Duration) error {
+	return p.stop(timeout, false)
+}
+
+func (p *ProcessCommand) StopForce(timeout time.Duration) error {
+	return p.stop(timeout, true)
+}
+
+func (p *ProcessCommand) stop(timeout time.Duration, force bool) error {
 	req := stopReq{
 		timeout: timeout,
+		force:   force,
 		respond: make(chan error, 1),
 	}
 	select {
 	case p.stopCh <- req:
 	case <-p.parentCtx.Done():
-		return fmt.Errorf("[%s] shutdown", p.id)
+		return fmt.Errorf("[%s]: %w", p.id, ErrShutdown)
 	}
 	return <-req.respond
 }

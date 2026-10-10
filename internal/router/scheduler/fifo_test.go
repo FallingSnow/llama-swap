@@ -105,7 +105,7 @@ func (f *fakeEffects) GrantServe(req HandlerReq, modelID string) bool {
 	return ok
 }
 
-func (f *fakeEffects) StopProcesses(timeout time.Duration, ids []string) {
+func (f *fakeEffects) StopProcesses(timeout time.Duration, force bool, ids []string) {
 	f.stops = append(f.stops, stopRec{timeout: timeout, ids: ids})
 }
 
@@ -576,7 +576,7 @@ func TestFIFO_OnUnload_ReleasesActiveWaiters(t *testing.T) {
 	s.OnRequest(req("a")) // active swap a with one waiter
 	s.OnRequest(req("a")) // join
 
-	s.OnUnload([]string{"a"}, time.Second)
+	s.OnUnload([]string{"a"}, time.Second, false)
 
 	if got := eff.errored("a"); got != 2 {
 		t.Errorf("errored(a)=%d want 2 (active swap waiters released)", got)
@@ -599,7 +599,7 @@ func TestFIFO_OnUnload_DropsQueuedRequests(t *testing.T) {
 	s.OnRequest(req("a")) // StartSwap(a)
 	s.OnRequest(req("b")) // queued
 
-	s.OnUnload([]string{"b"}, time.Second)
+	s.OnUnload([]string{"b"}, time.Second, false)
 
 	if got := eff.errored("b"); got != 1 {
 		t.Errorf("errored(b)=%d want 1 (queued request dropped)", got)

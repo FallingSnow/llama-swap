@@ -61,7 +61,7 @@ type Scheduler interface {
 	// OnUnload reconciles scheduler state for an unload, stops the targeted
 	// processes via Effects, and drains the queue. It must block until the
 	// targeted processes have stopped.
-	OnUnload(targets []string, timeout time.Duration)
+	OnUnload(targets []string, timeout time.Duration, force bool)
 	// OnShutdown grants err to every waiter the scheduler still holds (active
 	// swap waiters and queued requests). Process teardown is the baseRouter's
 	// responsibility.
@@ -88,8 +88,9 @@ type Effects interface {
 	// its in-flight count only when this returns true.
 	GrantServe(req HandlerReq, modelID string) bool
 	// StopProcesses stops the named processes in parallel and blocks until all
-	// have stopped. Unknown IDs are skipped.
-	StopProcesses(timeout time.Duration, ids []string)
+	// have stopped. Unknown IDs are skipped. When force is true the processes
+	// are killed directly, skipping any configured sleeper.
+	StopProcesses(timeout time.Duration, force bool, ids []string)
 }
 
 // New returns a Scheduler selected by conf.Routing.Scheduler.Use, configured

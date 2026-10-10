@@ -123,7 +123,7 @@ func TestBaseRouter_UnloadAll(t *testing.T) {
 	c.markReady()
 
 	b := newTestBase(t, map[string]process.Process{"a": a, "c": c}, &stubPlanner{})
-	b.Unload(time.Second)
+	b.Unload(time.Second, false)
 
 	if a.State() != process.StateStopped || c.State() != process.StateStopped {
 		t.Fatalf("Unload() should stop every process: a=%q c=%q", a.State(), c.State())
@@ -137,7 +137,7 @@ func TestBaseRouter_UnloadSpecificModel(t *testing.T) {
 	c.markReady()
 
 	b := newTestBase(t, map[string]process.Process{"a": a, "c": c}, &stubPlanner{})
-	b.Unload(time.Second, "a")
+	b.Unload(time.Second, false, "a")
 
 	if a.State() != process.StateStopped {
 		t.Errorf("a should be stopped, got %q", a.State())
@@ -162,7 +162,7 @@ func TestBaseRouter_UnloadSpecificModelUsesConfiguredTimeout(t *testing.T) {
 		},
 	}
 	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a, "c": c}, &stubPlanner{})
-	b.Unload(0, "a")
+	b.Unload(0, false, "a")
 
 	if a.lastStopTimeout() != 45*time.Second {
 		t.Errorf("a stop timeout=%v want 45s", a.lastStopTimeout())
@@ -187,7 +187,7 @@ func TestBaseRouter_UnloadAllUsesConfiguredTimeouts(t *testing.T) {
 		},
 	}
 	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a, "c": c}, &stubPlanner{})
-	b.Unload(0)
+	b.Unload(0, false)
 
 	if a.lastStopTimeout() != 45*time.Second {
 		t.Errorf("a stop timeout=%v want 45s", a.lastStopTimeout())
@@ -227,7 +227,7 @@ func TestBaseRouter_UnloadStopsSmallestTimeoutFirst(t *testing.T) {
 	}
 	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a, "c": c, "e": e}, &stubPlanner{})
 	// Named in descending timeout order; Unload must re-order ascending.
-	b.Unload(0, "a", "e", "c")
+	b.Unload(0, false, "a", "e", "c")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -258,7 +258,7 @@ func TestBaseRouter_UnloadZeroStopsSameTimeoutInParallel(t *testing.T) {
 
 	unloadDone := make(chan struct{})
 	go func() {
-		b.Unload(0)
+		b.Unload(0, false)
 		close(unloadDone)
 	}()
 
@@ -294,7 +294,7 @@ func TestBaseRouter_UnloadPositiveTimeoutOverridesConfigured(t *testing.T) {
 		},
 	}
 	b := newTestBaseWithConfig(t, conf, map[string]process.Process{"a": a}, &stubPlanner{})
-	b.Unload(time.Second, "a")
+	b.Unload(time.Second, false, "a")
 
 	if a.lastStopTimeout() != time.Second {
 		t.Errorf("a stop timeout=%v want 1s", a.lastStopTimeout())
@@ -321,7 +321,7 @@ func TestBaseRouter_Unload_StopsInParallel(t *testing.T) {
 
 	unloadDone := make(chan struct{})
 	go func() {
-		b.Unload(time.Second, "a", "b", "c")
+		b.Unload(time.Second, false, "a", "b", "c")
 		close(unloadDone)
 	}()
 

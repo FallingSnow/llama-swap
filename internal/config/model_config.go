@@ -93,6 +93,27 @@ func (c ModelCapConfig) Validate() error {
 	return nil
 }
 
+// SwapOutStrategyCudaCheckpoint is the ModelConfig.SwapOutStrategy value that
+// selects the cuda-checkpoint sleeper.
+const SwapOutStrategyCudaCheckpoint = "cuda-checkpoint"
+
+// validSwapOutStrategies is the set of supported swapOutStrategy values. The
+// empty string is the default (kill/restart).
+var validSwapOutStrategies = map[string]struct{}{
+	"":                          {},
+	SwapOutStrategyCudaCheckpoint: {},
+}
+
+// Validate checks that the per-model SwapOutStrategy is a supported value, so
+// a typo is caught at parse time rather than surfacing (or not) later in
+// internal/process. Returns an error if the value is unrecognized.
+func (m ModelConfig) Validate() error {
+	if _, ok := validSwapOutStrategies[m.SwapOutStrategy]; !ok {
+		return fmt.Errorf("swapOutStrategy: invalid value %q, must be one of: (empty), cuda-checkpoint", m.SwapOutStrategy)
+	}
+	return nil
+}
+
 // TimeoutsConfig holds timeout settings for proxy connections
 // 0 = no timeout
 type TimeoutsConfig struct {
@@ -112,16 +133,22 @@ type CompatConfig struct {
 }
 
 type ModelConfig struct {
-	Cmd           string   `yaml:"cmd"`
-	CmdStop       string   `yaml:"cmdStop"`
-	Proxy         string   `yaml:"proxy"`
-	Aliases       []string `yaml:"aliases"`
-	Env           []string `yaml:"env"`
-	CheckEndpoint string   `yaml:"checkEndpoint"`
-	UnloadAfter   int      `yaml:"ttl"`
-	UnloadTimeout int      `yaml:"unloadTimeout"`
-	Unlisted      bool     `yaml:"unlisted"`
-	UseModelName  string   `yaml:"useModelName"`
+	Cmd     string `yaml:"cmd"`
+	CmdStop string `yaml:"cmdStop"`
+	// SwapOutStrategy selects how the model is offloaded when swapped out.
+	// Empty (the default) kills the process and restarts it on swap-in.
+	// "cuda-checkpoint" suspends the process's CUDA state (freeing the GPU
+	// while the process stays alive) and restores it on swap-in, avoiding a
+	// full cold start. See internal/process for the supported values.
+	SwapOutStrategy string   `yaml:"swapOutStrategy"`
+	Proxy           string   `yaml:"proxy"`
+	Aliases         []string `yaml:"aliases"`
+	Env             []string `yaml:"env"`
+	CheckEndpoint   string   `yaml:"checkEndpoint"`
+	UnloadAfter     int      `yaml:"ttl"`
+	UnloadTimeout   int      `yaml:"unloadTimeout"`
+	Unlisted        bool     `yaml:"unlisted"`
+	UseModelName    string   `yaml:"useModelName"`
 
 	// #179 for /v1/models
 	Name        string `yaml:"name"`
@@ -167,6 +194,7 @@ func (m *ModelConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	defaults := rawModelConfig{
 		Cmd:              "",
 		CmdStop:          "",
+		SwapOutStrategy:  "",
 		Proxy:            MODEL_CONFIG_DEFAULT_PROXY,
 		Aliases:          []string{},
 		Env:              []string{},

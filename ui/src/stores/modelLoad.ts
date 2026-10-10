@@ -2,6 +2,10 @@ import { writable } from "svelte/store";
 import { loadModel, unloadSingleModel } from "./api";
 import type { Model } from "../lib/types";
 
+export function unloadModel(m: Model, force = false): void {
+  void unloadSingleModel(m.id, force);
+}
+
 export const pendingLoads = writable<Record<string, boolean>>({});
 const loadControllers = new Map<string, AbortController>();
 
@@ -36,12 +40,12 @@ export function isPending(id: string): boolean {
 }
 
 export function onToggleLoad(m: Model): void {
-  if (m.state === "stopped" && isPending(m.id)) {
+  if ((m.state === "stopped" || m.state === "suspended") && isPending(m.id)) {
     cancelLoad(m.id);
-  } else if (m.state === "stopped") {
+  } else if (m.state === "stopped" || m.state === "suspended") {
     void handleLoadModel(m.id);
   } else if (m.state === "ready") {
-    void unloadSingleModel(m.id);
+    unloadModel(m);
   }
 }
 
@@ -62,5 +66,6 @@ export function statusDotColor(m: Model | undefined): string {
   if (!m) return "bg-muted-foreground/40";
   if (m.state === "ready") return "bg-success";
   if (m.state === "starting" || m.state === "stopping") return "bg-warning";
+  if (m.state === "suspended") return "bg-info";
   return "bg-muted-foreground/40";
 }

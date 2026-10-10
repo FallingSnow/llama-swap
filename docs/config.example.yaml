@@ -407,6 +407,15 @@ models:
     # - useful for slow cmdStop commands such as docker stop
     unloadTimeout: 10
 
+    # swapOutStrategy: how the model is offloaded when swapped out
+    # - optional, default: "" (kill the process and restart it on swap-in)
+    # - "cuda-checkpoint" suspends the process's CUDA state (freeing the GPU
+    #   while the process stays alive) and restores it on swap-in, avoiding a
+    #   full cold start. Requires the cuda-checkpoint binary on PATH and
+    #   NVIDIA driver 550+; Linux only. Falls back to kill/restart if the
+    #   checkpoint or restore fails.
+    # swapOutStrategy: cuda-checkpoint
+
     # compat: compatibility settings for upstream applications
     # - optional, default: empty
     compat:

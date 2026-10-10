@@ -162,6 +162,10 @@ func LoadConfigFromReader(r io.Reader) (Config, error) {
 			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
 		}
 
+		if err := modelConfig.Validate(); err != nil {
+			return Config{}, fmt.Errorf("model %s: %w", modelId, err)
+		}
+
 		// Auto-register setParamsByID keys as aliases (skip the model's own ID)
 		for key := range modelConfig.Filters.SetParamsByID {
 			if key == modelId {

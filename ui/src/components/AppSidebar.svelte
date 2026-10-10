@@ -45,10 +45,11 @@
     $models.filter((model) => model.peerID && ($showUnlistedModels || !model.unlisted)),
   );
 
-  type DotColor = "grey" | "yellow" | "green";
+  type DotColor = "grey" | "yellow" | "green" | "blue";
   function statusDotColor(model: Model): DotColor {
     if (model.state === "ready") return "green";
     if (model.state === "starting" || model.state === "stopping") return "yellow";
+    if (model.state === "suspended") return "blue";
     return "grey";
   }
 
@@ -56,6 +57,7 @@
     grey: "bg-muted-foreground/40",
     yellow: "bg-warning",
     green: "bg-success",
+    blue: "bg-info",
   };
 </script>
 

@@ -442,6 +442,15 @@
                         "default": "",
                         "description": "Command to run to stop the model gracefully. Uses ${PID} macro for upstream process id. If empty, default shutdown behavior is used."
                     },
+                    "swapOutStrategy": {
+                        "type": "string",
+                        "default": "",
+                        "enum": [
+                            "",
+                            "cuda-checkpoint"
+                        ],
+                        "description": "How the model is offloaded when swapped out. Empty (default) kills the process and restarts it on swap-in. 'cuda-checkpoint' suspends the process's CUDA state with NVIDIA's cuda-checkpoint utility, freeing the GPU while the process stays alive, then restores it on swap-in to avoid a full cold start. Requires the cuda-checkpoint binary on PATH and NVIDIA driver 550+; Linux only. Falls back to kill/restart if the checkpoint or restore fails."
+                    },
                     "name": {
                         "type": "string",
                         "default": "",

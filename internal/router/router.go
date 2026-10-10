@@ -50,8 +50,9 @@ type LocalRouter interface {
 	// gives each process its configured unloadTimeout to stop gracefully:
 	// models sharing a timeout stop in parallel, smaller timeouts before
 	// larger ones. A positive timeout overrides the configured values for
-	// every target.
-	Unload(timeout time.Duration, models ...string)
+	// every target. When force is true the process is killed directly,
+	// skipping any configured sleeper (suspend).
+	Unload(timeout time.Duration, force bool, models ...string)
 
 	// ProcessLogger returns the log monitor for the named model's process.
 	// modelID must be a real (non-alias) config key. Returns false when the
